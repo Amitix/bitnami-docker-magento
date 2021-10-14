@@ -137,219 +137,182 @@ magento_initialize() {
     local db_host db_port db_name db_user db_pass
     local es_host es_port es_user es_pass
     local -r app_name="magento"
-    if ! is_app_initialized "$app_name"; then
-        # Parse user inputs for the Magento CLI calls below
-        db_host="$MAGENTO_DATABASE_HOST"
-        db_port="$MAGENTO_DATABASE_PORT_NUMBER"
-        db_name="$MAGENTO_DATABASE_NAME"
-        db_user="$MAGENTO_DATABASE_USER"
-        db_pass="$MAGENTO_DATABASE_PASSWORD"
-        # CLI flags to use for 'setup:config:create' (to create config files but not modify the database)
-        local -a magento_setup_cli_flags=(
-            "--no-interaction"
-            "--backend-frontname" "$MAGENTO_ADMIN_URL_PREFIX"
-            "--db-host" "${db_host}:${db_port}"
-            "--db-name" "$db_name"
-            "--db-user" "$db_user"
-            "--db-password" "$db_pass"
+    
+    # Parse user inputs for the Magento CLI calls below
+    db_host="$MAGENTO_DATABASE_HOST"
+    db_port="$MAGENTO_DATABASE_PORT_NUMBER"
+    db_name="$MAGENTO_DATABASE_NAME"
+    db_user="$MAGENTO_DATABASE_USER"
+    db_pass="$MAGENTO_DATABASE_PASSWORD"
+    # CLI flags to use for 'setup:config:create' (to create config files but not modify the database)
+    local -a magento_setup_cli_flags=(
+        "--no-interaction"
+        "--backend-frontname" "$MAGENTO_ADMIN_URL_PREFIX"
+        "--db-host" "${db_host}:${db_port}"
+        "--db-name" "$db_name"
+        "--db-user" "$db_user"
+        "--db-password" "$db_pass"
+    )
+    # Extra flags for when enabling SSL database connections
+    if is_boolean_yes "$MAGENTO_ENABLE_DATABASE_SSL"; then
+        info "Enabling SSL for database connections"
+        is_boolean_yes "$MAGENTO_VERIFY_DATABASE_SSL" && magento_setup_cli_flags+=("--db-ssl-verify")
+        ! is_empty_value "$MAGENTO_DATABASE_SSL_CERT_FILE" && magento_setup_cli_flags+=("--db-ssl-cert" "$MAGENTO_DATABASE_SSL_CERT_FILE")
+        ! is_empty_value "$MAGENTO_DATABASE_SSL_KEY_FILE" && magento_setup_cli_flags+=("--db-ssl-key" "$MAGENTO_DATABASE_SSL_KEY_FILE")
+        ! is_empty_value "$MAGENTO_DATABASE_SSL_CA_FILE" && magento_setup_cli_flags+=("--db-ssl-ca" "$MAGENTO_DATABASE_SSL_CA_FILE")
+    fi
+    # Set cache server (i.e. Varnish) configuration to Magento's 'env.php' configuration file
+    if is_boolean_yes "$MAGENTO_ENABLE_HTTP_CACHE"; then
+        info "Enabling HTTP cache server"
+        magento_setup_cli_flags+=("--http-cache-hosts" "${MAGENTO_HTTP_CACHE_SERVER_HOST}:${MAGENTO_HTTP_CACHE_SERVER_PORT_NUMBER}")
+    fi
+    # CLI flags to use for 'setup:install' (based on the flags to use for 'setup:config:create')
+    local -a magento_install_cli_flags=(
+        "${magento_setup_cli_flags[@]}"
+        "--search-engine" "$MAGENTO_SEARCH_ENGINE"
+        "--admin-firstname" "$MAGENTO_FIRST_NAME"
+        "--admin-lastname" "$MAGENTO_LAST_NAME"
+        "--admin-email" "$MAGENTO_EMAIL"
+        "--admin-user" "$MAGENTO_USERNAME"
+        "--admin-password" "$MAGENTO_PASSWORD"
+    )
+    # Search engine configuration
+    if [[ "$MAGENTO_SEARCH_ENGINE" =~ ^elasticsearch ]]; then
+        es_host="$MAGENTO_ELASTICSEARCH_HOST"
+        es_port="$MAGENTO_ELASTICSEARCH_PORT_NUMBER"
+        es_user="$MAGENTO_ELASTICSEARCH_USER"
+        es_pass="$MAGENTO_ELASTICSEARCH_PASSWORD"
+        # Define whether Elasticsearch auth is enabled
+        local es_auth="0"
+        is_boolean_yes "$MAGENTO_ELASTICSEARCH_ENABLE_AUTH" && es_auth="1"
+        # Elasticsearch configuration is stored in the database, so we only need to specify for 'setup:install'
+        magento_install_cli_flags+=(
+            "--elasticsearch-host" "$es_host"
+            "--elasticsearch-port" "$es_port"
+            "--elasticsearch-enable-auth" "$es_auth"
+            "--elasticsearch-username" "$es_user"
+            "--elasticsearch-password" "$es_pass"
         )
-        # Extra flags for when enabling SSL database connections
-        if is_boolean_yes "$MAGENTO_ENABLE_DATABASE_SSL"; then
-            info "Enabling SSL for database connections"
-            is_boolean_yes "$MAGENTO_VERIFY_DATABASE_SSL" && magento_setup_cli_flags+=("--db-ssl-verify")
-            ! is_empty_value "$MAGENTO_DATABASE_SSL_CERT_FILE" && magento_setup_cli_flags+=("--db-ssl-cert" "$MAGENTO_DATABASE_SSL_CERT_FILE")
-            ! is_empty_value "$MAGENTO_DATABASE_SSL_KEY_FILE" && magento_setup_cli_flags+=("--db-ssl-key" "$MAGENTO_DATABASE_SSL_KEY_FILE")
-            ! is_empty_value "$MAGENTO_DATABASE_SSL_CA_FILE" && magento_setup_cli_flags+=("--db-ssl-ca" "$MAGENTO_DATABASE_SSL_CA_FILE")
-        fi
-        # Set cache server (i.e. Varnish) configuration to Magento's 'env.php' configuration file
+    fi
+    # Allow to specify extra CLI flags, but ensure they are added last
+    local -a magento_extra_cli_flags
+    read -r -a magento_extra_cli_flags <<< "$MAGENTO_EXTRA_INSTALL_ARGS"
+    if [[ "${#magento_extra_cli_flags[@]}" -gt 0 ]]; then
+        magento_setup_cli_flags+=("${magento_extra_cli_flags[@]}")
+        magento_install_cli_flags+=("${magento_extra_cli_flags[@]}")
+    fi
+
+    # Ensure Magento persisted directories exist (i.e. when a volume has been mounted to /bitnami)
+    info "Ensuring Magento directories exist"
+    ensure_dir_exists "$MAGENTO_VOLUME_DIR"
+    # Use daemon:root ownership for compatibility when running as a non-root user
+    if am_i_root; then
+        info "Configuring permissions"
+        configure_permissions_ownership "$MAGENTO_VOLUME_DIR" -d "775" -f "664" -u "$WEB_SERVER_DAEMON_USER" -g "root"
+    fi
+
+    # Wait until external services are available
+    info "Trying to connect to the database server"
+    magento_wait_for_db_connection "$db_host" "$db_port" "$db_name" "$db_user" "$db_pass"
+    if [[ "$MAGENTO_SEARCH_ENGINE" =~ ^elasticsearch ]]; then
+        info "Trying to connect to Elasticsearch"
+        magento_wait_for_es_connection "$es_host" "$es_port"
+    fi
+
+    if ! is_boolean_yes "$MAGENTO_SKIP_BOOTSTRAP"; then
+        info "Running Magento install script"
+        magento_execute setup:install "${magento_install_cli_flags[@]}"
+
+        # Define whether the site must be accessed via HTTP or HTTPS
+        # If the site must be accessed via HTTPS, we will force the admin panel to be accessed via HTTPS too
+        local use_secure="0"
+        is_boolean_yes "$MAGENTO_ENABLE_HTTPS" && use_secure="1"
+        local use_secure_admin="0"
+        ( is_boolean_yes "$MAGENTO_ENABLE_HTTPS" || is_boolean_yes "$MAGENTO_ENABLE_ADMIN_HTTPS" ) && use_secure_admin="1"
+
+        # Set additional store configuration in the database
+        # These options were previously added via 'magento setup:install', but that is now deprecated
+        # See: https://devdocs.magento.com/guides/v2.4/config-guide/prod/config-reference-most.html#web-paths
+        # Enable/disable HTTPS in frontend and admin panel, respectively
+        magento_conf_set "web/secure/use_in_frontend" "$use_secure"
+        magento_conf_set "web/secure/use_in_adminhtml" "$use_secure_admin"
+        # Set domain name
+        magento_update_hostname "$MAGENTO_HOST"
+        # Enable friendly URLs
+        magento_conf_set "web/seo/use_rewrites" 1
+        # Enable HTTP cache: https://devdocs.magento.com/guides/v2.4/config-guide/varnish/config-varnish-magento.html
         if is_boolean_yes "$MAGENTO_ENABLE_HTTP_CACHE"; then
-            info "Enabling HTTP cache server"
-            magento_setup_cli_flags+=("--http-cache-hosts" "${MAGENTO_HTTP_CACHE_SERVER_HOST}:${MAGENTO_HTTP_CACHE_SERVER_PORT_NUMBER}")
+            # Set Varnish as cache server (1: built-in, 2: Varnish)
+            # See: vendor/magento/module-page-cache/model/Config.php -> "Cache types" comment
+            magento_conf_set "system/full_page_cache/caching_application" 2
+            # Specify backend host/port for Varnish config file generation via Admin panel
+            magento_conf_set "system/full_page_cache/varnish/backend_host" "$MAGENTO_HTTP_CACHE_BACKEND_HOST"
+            magento_conf_set "system/full_page_cache/varnish/backend_port" "$MAGENTO_HTTP_CACHE_BACKEND_PORT_NUMBER"
         fi
-        # CLI flags to use for 'setup:install' (based on the flags to use for 'setup:config:create')
-        local -a magento_install_cli_flags=(
-            "${magento_setup_cli_flags[@]}"
-            "--search-engine" "$MAGENTO_SEARCH_ENGINE"
-            "--admin-firstname" "$MAGENTO_FIRST_NAME"
-            "--admin-lastname" "$MAGENTO_LAST_NAME"
-            "--admin-email" "$MAGENTO_EMAIL"
-            "--admin-user" "$MAGENTO_USERNAME"
-            "--admin-password" "$MAGENTO_PASSWORD"
-        )
-        # Search engine configuration
-        if [[ "$MAGENTO_SEARCH_ENGINE" =~ ^elasticsearch ]]; then
-            es_host="$MAGENTO_ELASTICSEARCH_HOST"
-            es_port="$MAGENTO_ELASTICSEARCH_PORT_NUMBER"
-            es_user="$MAGENTO_ELASTICSEARCH_USER"
-            es_pass="$MAGENTO_ELASTICSEARCH_PASSWORD"
-            # Define whether Elasticsearch auth is enabled
-            local es_auth="0"
-            is_boolean_yes "$MAGENTO_ELASTICSEARCH_ENABLE_AUTH" && es_auth="1"
-            # Elasticsearch configuration is stored in the database, so we only need to specify for 'setup:install'
-            magento_install_cli_flags+=(
-                "--elasticsearch-host" "$es_host"
-                "--elasticsearch-port" "$es_port"
-                "--elasticsearch-enable-auth" "$es_auth"
-                "--elasticsearch-username" "$es_user"
-                "--elasticsearch-password" "$es_pass"
-            )
-        fi
-        # Allow to specify extra CLI flags, but ensure they are added last
-        local -a magento_extra_cli_flags
-        read -r -a magento_extra_cli_flags <<< "$MAGENTO_EXTRA_INSTALL_ARGS"
-        if [[ "${#magento_extra_cli_flags[@]}" -gt 0 ]]; then
-            magento_setup_cli_flags+=("${magento_extra_cli_flags[@]}")
-            magento_install_cli_flags+=("${magento_extra_cli_flags[@]}")
-        fi
-
-        # Ensure Magento persisted directories exist (i.e. when a volume has been mounted to /bitnami)
-        info "Ensuring Magento directories exist"
-        ensure_dir_exists "$MAGENTO_VOLUME_DIR"
-        # Use daemon:root ownership for compatibility when running as a non-root user
-        if am_i_root; then
-            info "Configuring permissions"
-            configure_permissions_ownership "$MAGENTO_VOLUME_DIR" -d "775" -f "664" -u "$WEB_SERVER_DAEMON_USER" -g "root"
-        fi
-
-        # Wait until external services are available
-        info "Trying to connect to the database server"
-        magento_wait_for_db_connection "$db_host" "$db_port" "$db_name" "$db_user" "$db_pass"
-        if [[ "$MAGENTO_SEARCH_ENGINE" =~ ^elasticsearch ]]; then
-            info "Trying to connect to Elasticsearch"
-            magento_wait_for_es_connection "$es_host" "$es_port"
-        fi
-
-        if ! is_boolean_yes "$MAGENTO_SKIP_BOOTSTRAP"; then
-            info "Running Magento install script"
-            magento_execute setup:install "${magento_install_cli_flags[@]}"
-
-            # Define whether the site must be accessed via HTTP or HTTPS
-            # If the site must be accessed via HTTPS, we will force the admin panel to be accessed via HTTPS too
-            local use_secure="0"
-            is_boolean_yes "$MAGENTO_ENABLE_HTTPS" && use_secure="1"
-            local use_secure_admin="0"
-            ( is_boolean_yes "$MAGENTO_ENABLE_HTTPS" || is_boolean_yes "$MAGENTO_ENABLE_ADMIN_HTTPS" ) && use_secure_admin="1"
-
-            # Set additional store configuration in the database
-            # These options were previously added via 'magento setup:install', but that is now deprecated
-            # See: https://devdocs.magento.com/guides/v2.4/config-guide/prod/config-reference-most.html#web-paths
-            # Enable/disable HTTPS in frontend and admin panel, respectively
-            magento_conf_set "web/secure/use_in_frontend" "$use_secure"
-            magento_conf_set "web/secure/use_in_adminhtml" "$use_secure_admin"
-            # Set domain name
-            magento_update_hostname "$MAGENTO_HOST"
-            # Enable friendly URLs
-            magento_conf_set "web/seo/use_rewrites" 1
-            # Enable HTTP cache: https://devdocs.magento.com/guides/v2.4/config-guide/varnish/config-varnish-magento.html
-            if is_boolean_yes "$MAGENTO_ENABLE_HTTP_CACHE"; then
-                # Set Varnish as cache server (1: built-in, 2: Varnish)
-                # See: vendor/magento/module-page-cache/model/Config.php -> "Cache types" comment
-                magento_conf_set "system/full_page_cache/caching_application" 2
-                # Specify backend host/port for Varnish config file generation via Admin panel
-                magento_conf_set "system/full_page_cache/varnish/backend_host" "$MAGENTO_HTTP_CACHE_BACKEND_HOST"
-                magento_conf_set "system/full_page_cache/varnish/backend_port" "$MAGENTO_HTTP_CACHE_BACKEND_PORT_NUMBER"
-            fi
-        else
-            info "An already initialized Magento database was provided, configuration will be skipped"
-
-            info "Generating configuration files"
-            # First generate the 'env.php' configuration file
-            # It is essential to add the 'installed' setting, or none of the below calls would work
-            # Note: The file will be prettified/regenerated after running the commands
-            magento_execute setup:config:set "${magento_setup_cli_flags[@]}"
-            replace_in_file "$MAGENTO_CONF_FILE" '\];' ",'install' => ['date' => '$(date -u)']];"
-            # The below steps are usually handled by the installation script, which is not executed in this case
-            # Enable all modules to generate the 'config.php' file
-            magento_execute module:enable --all
-            # Enable all cache types in 'env.php' (none are enabled via 'setup:config:set')
-            magento_execute cache:enable
-
-            # Finally, after the Magento is properly installed on disk, perform database schema upgrade
-            info "Upgrading database schema"
-            magento_execute setup:upgrade
-        fi
-
-        # The below steps are common for both normal installations and installations with 'MAGENTO_SKIP_BOOTSTRAP',
-        # since they rely on modifying files generated during initialization
-
-        # Disable 2FA module by default as it prevents access to admin panel after the first login
-        # Setup would be hard as it would require to configure Sendmail (SMTP not supported) and authorization keys
-        # 'You need to configure Two-Factor Authorization in order to proceed to your store's admin area'
-        # 'An E-mail was sent to you with further instructions'
-        magento_execute module:disable "Magento_TwoFactorAuth"
-
-        # Set the Magento mode in 'env.php'
-        # See: https://devdocs.magento.com/guides/v2.4/config-guide/bootstrap/magento-modes.html
-        magento_execute deploy:mode:set "$MAGENTO_MODE"
-
-        # Create initial indexes (this is not performed by the setup script)
-        if is_boolean_yes "$MAGENTO_SKIP_REINDEX"; then
-            info "Skipping reindex"
-        else
-            info "Reindexing"
-            magento_execute indexer:reindex
-        fi
-
-        # Flush cache after changing configuration and reindexing, to avoid warnings in admin panel
-        info "Flushing cache"
-        magento_execute cache:flush
-
-        # Magento 'default' and 'developer' modes build required assets on demand
-        # However, due to the huge amount of those, the first-time page load is huge, so we build them beforehand
-        if is_boolean_yes "$MAGENTO_DEPLOY_STATIC_CONTENT" && [[ "$MAGENTO_MODE" != "production" ]]; then
-            info "Deploying static files"
-            magento_execute setup:static-content:deploy -f
-        fi
-
-        # Configure PHP options provided via envvars in .user.ini (which overrides configuration in php.ini)
-        for user_ini_file in "${MAGENTO_BASE_DIR}/.user.ini" "${MAGENTO_BASE_DIR}/pub/.user.ini"; do
-            configure_permissions_ownership "$user_ini_file" -f "660"
-            php_set_runtime_config "$user_ini_file"
-            # Ensure that the .user.ini files cannot be written to by the web server user
-            # This file allows for PHP-FPM to set application-specific PHP settings, and could be a security risk if left writable
-            configure_permissions_ownership "$user_ini_file" -f "440"
-        done
-
-        info "Persisting Magento installation"
-        persist_app "$app_name" "$MAGENTO_DATA_TO_PERSIST"
     else
-        info "Restoring persisted Magento installation"
-        restore_persisted_app "$app_name" "$MAGENTO_DATA_TO_PERSIST"
+        info "An already initialized Magento database was provided, configuration will be skipped"
 
-        # Compatibility with previous container images
-        if [[ "$(ls "$MAGENTO_VOLUME_DIR")" = "htdocs" ]]; then
-            warn "The persisted data for this Magento installation is located at '${MAGENTO_VOLUME_DIR}/htdocs' instead of '${MAGENTO_VOLUME_DIR}'"
-            warn "This is deprecated and support for this may be removed in a future release"
-            rm "$MAGENTO_BASE_DIR"
-            ln -s "${MAGENTO_VOLUME_DIR}/htdocs" "$MAGENTO_BASE_DIR"
-        fi
+        info "Generating configuration files"
+        # First generate the 'env.php' configuration file
+        # It is essential to add the 'installed' setting, or none of the below calls would work
+        # Note: The file will be prettified/regenerated after running the commands
+        magento_execute setup:config:set "${magento_setup_cli_flags[@]}"
+        replace_in_file "$MAGENTO_CONF_FILE" '\];' ",'install' => ['date' => '$(date -u)']];"
+        # The below steps are usually handled by the installation script, which is not executed in this case
+        # Enable all modules to generate the 'config.php' file
+        magento_execute module:enable --all
+        # Enable all cache types in 'env.php' (none are enabled via 'setup:config:set')
+        magento_execute cache:enable
 
-        info "Trying to connect to the database server"
-        db_name="$(magento_conf_get "db" "connection" "default" "dbname")"
-        db_user="$(magento_conf_get "db" "connection" "default" "username")"
-        db_pass="$(magento_conf_get "db" "connection" "default" "password")"
-        # Separate 'host:port' with native Bash split functions (fallback to default port number if not specified)
-        db_host_port="$(magento_conf_get "db" "connection" "default" "host")"
-        db_host="${db_host_port%:*}"
-        if [[ "$db_host_port" =~ :[0-9]+$ ]]; then
-            # Use '##' to extract only the part after the last colon, to avoid any possible issues with IPv6 addresses
-            db_port="${db_host_port##*:}"
-        else
-            db_port="$MAGENTO_DATABASE_PORT_NUMBER"
-        fi
-        magento_wait_for_db_connection "$db_host" "$db_port" "$db_name" "$db_user" "$db_pass"
-
-        if [[ "$MAGENTO_SEARCH_ENGINE" =~ ^elasticsearch ]]; then
-            es_host="$MAGENTO_ELASTICSEARCH_HOST"
-            es_port="$MAGENTO_ELASTICSEARCH_PORT_NUMBER"
-            info "Trying to connect to Elasticsearch"
-            magento_wait_for_es_connection "$es_host" "$es_port"
-        fi
-
-        # Perform database schema upgrade
+        # Finally, after the Magento is properly installed on disk, perform database schema upgrade
         info "Upgrading database schema"
         magento_execute setup:upgrade
     fi
+
+    # The below steps are common for both normal installations and installations with 'MAGENTO_SKIP_BOOTSTRAP',
+    # since they rely on modifying files generated during initialization
+
+    # Disable 2FA module by default as it prevents access to admin panel after the first login
+    # Setup would be hard as it would require to configure Sendmail (SMTP not supported) and authorization keys
+    # 'You need to configure Two-Factor Authorization in order to proceed to your store's admin area'
+    # 'An E-mail was sent to you with further instructions'
+    magento_execute module:disable "Magento_TwoFactorAuth"
+
+    # Set the Magento mode in 'env.php'
+    # See: https://devdocs.magento.com/guides/v2.4/config-guide/bootstrap/magento-modes.html
+    magento_execute deploy:mode:set "$MAGENTO_MODE"
+
+    # Create initial indexes (this is not performed by the setup script)
+    if is_boolean_yes "$MAGENTO_SKIP_REINDEX"; then
+        info "Skipping reindex"
+    else
+        info "Reindexing"
+        magento_execute indexer:reindex
+    fi
+
+    # Flush cache after changing configuration and reindexing, to avoid warnings in admin panel
+    info "Flushing cache"
+    magento_execute cache:flush
+
+    # Magento 'default' and 'developer' modes build required assets on demand
+    # However, due to the huge amount of those, the first-time page load is huge, so we build them beforehand
+    if is_boolean_yes "$MAGENTO_DEPLOY_STATIC_CONTENT" && [[ "$MAGENTO_MODE" != "production" ]]; then
+        info "Deploying static files"
+        magento_execute setup:static-content:deploy -f
+    fi
+
+    # Configure PHP options provided via envvars in .user.ini (which overrides configuration in php.ini)
+    for user_ini_file in "${MAGENTO_BASE_DIR}/.user.ini" "${MAGENTO_BASE_DIR}/pub/.user.ini"; do
+        configure_permissions_ownership "$user_ini_file" -f "660"
+        php_set_runtime_config "$user_ini_file"
+        # Ensure that the .user.ini files cannot be written to by the web server user
+        # This file allows for PHP-FPM to set application-specific PHP settings, and could be a security risk if left writable
+        configure_permissions_ownership "$user_ini_file" -f "440"
+    done
+
+    info "Persisting Magento installation"
+    persist_app "$app_name" "$MAGENTO_DATA_TO_PERSIST"
+    
 
     # Magento includes a command for setting up the cron jobs via the 'cron:install' command
     # However, cron entries for the 'daemon' user are disabled in some Bitnami images for security purposes (via /etc/cron.deny)
